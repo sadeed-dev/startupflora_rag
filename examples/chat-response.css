@@ -1,0 +1,35 @@
+.rag-answer {
+  --rag-accent: #0f766e;
+  color: #243247;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  padding: clamp(18px, 4vw, 30px);
+  box-shadow: 0 8px 30px rgb(15 23 42 / 5%);
+  font: 400 15px/1.8 system-ui, sans-serif;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.rag-answer h3 { font-size: 1rem; line-height: 1.4; color: #0f172a; margin: 1.5em 0 .6em; }
+.rag-answer > :first-child { margin-top: 0; }
+.rag-answer > :last-child { margin-bottom: 0; }
+.rag-answer p { margin: .6em 0; white-space: pre-wrap; }
+.rag-answer strong { color: #0f172a; font-weight: 650; }
+.rag-answer ul, .rag-answer ol { padding-left: 1.6em; margin: .7em 0; }
+.rag-answer li { padding-left: .3em; margin: .5em 0; }
+.rag-answer li::marker { color: var(--rag-accent); font-weight: 650; }
+.rag-table-scroll { overflow-x: auto; margin: 1em 0; border: 1px solid #e2e8f0; border-radius: 12px; }
+.rag-answer table { width: 100%; border-collapse: collapse; font-size: .94em; }
+.rag-answer th, .rag-answer td { text-align: left; padding: 12px 16px; vertical-align: top; border-bottom: 1px solid #e2e8f0; min-width: 110px; }
+.rag-answer th { background: #f0fdfa; color: #115e59; font-weight: 650; }
+.rag-answer tbody tr:nth-child(even) { background: #f8fafc; }
+.rag-answer tbody tr:last-child td { border-bottom: 0; }
+.rag-answer a { color: var(--rag-accent); text-underline-offset: 3px; }
+.rag-answer a:focus-visible, .rag-table-scroll:focus-visible { outline: 2px solid var(--rag-accent); outline-offset: 3px; }
+.rag-sources { display: flex; flex-wrap: wrap; gap: 8px; border-top: 1px solid #e2e8f0; padding-top: 12px; }
+.rag-sources a { font-size: .8em; background: #f0fdfa; border-radius: 8px; padding: 4px 10px; }
+.rag-thinking { display: flex; align-items: center; gap: 10px; color: #64748b; }
+.rag-thinking::before { content: ''; width: 9px; height: 9px; background: var(--rag-accent); border-radius: 50%; animation: rag-pulse 1.2s ease-in-out infinite; }
+.rag-error { color: #b91c1c; }
+@keyframes rag-pulse { 50% { opacity: .3; transform: scale(.75); } }
+@media (prefers-reduced-motion: reduce) { .rag-thinking::before { animation: none; } }

@@ -1,0 +1,2 @@
+{"query":"What documents are needed for the service described on this reviewed page?","expected_sources":["https://startupflora.com/REPLACE_WITH_REVIEWED_SERVICE_PATH"],"should_abstain":false}
+{"query":"What are the maintenance instructions for a spaceship engine?","expected_sources":[],"should_abstain":true}

@@ -1,0 +1,17 @@
+# Tested direct dependencies; see requirements.lock.txt for the full tested set.
+langchain-core==1.6.10
+langchain-openai==1.7.1
+langchain-qdrant==1.1.0
+langchain-text-splitters==1.1.3
+qdrant-client==1.19.1
+openai==3.31.0
+pydantic==2.14.1
+tiktoken==0.14.0
+fastapi==0.143.0
+uvicorn==0.54.0
+httpx==0.28.1
+python-dotenv==1.2.4
+beautifulsoup4==4.15.0
+pypdf==6.20.1
+defusedxml==0.7.1
+socksio==1.0.0
