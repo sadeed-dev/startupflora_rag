@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from qdrant_client import QdrantClient
 
-from rag.agent import Agent
+from rag.agent import Agent, certificate_clarification, conversational_reply
 from rag.config import Settings, load_settings
 from rag.crawler import Website
 from rag.ingest import Ingestor
@@ -147,6 +147,20 @@ def rig(tmp_path):
     agent = Agent(s, store, models, retriever)
     yield SimpleNamespace(s=s, store=store, models=models, r=retriever, ing=ingestor, agent=agent)
     q.close()
+
+
+def test_optimized_answer_still_verifies_and_records_stages(rig):
+    from rag.timing import request_timings
+
+    cid = rig.store.conversation("timing-check")["id"]
+    assert rig.s.final_chunks == 3 and rig.s.verify_answers is True
+    with request_timings("test-request") as trace:
+        result = rig.agent.respond("timing-check", cid, "DPIIT registration documents", str(uuid.uuid4()))
+    assert result["status"] == "answered"
+    assert trace["calls"]["retrieval"] >= 1
+    assert trace["calls"]["generation"] >= 1
+    assert trace["calls"]["verification"] >= 1
+    assert trace["calls"]["persistence"] == 1
 
 
 def test_settings_default_to_local_and_hide_secrets(tmp_path):
@@ -348,6 +362,40 @@ def test_invalid_citations_and_links_fail_closed(rig):
         assert rig.agent.validate_answer(answer, e)["status"] == "insufficient_evidence"
 
 
+def test_invalid_first_answer_is_repaired_with_verified_citations(rig):
+    rig.models.chat.next_tools = [("Answer", {
+        "answer": "A registration certificate is listed. [S999]",
+        "source_ids": ["S999"], "status": "answered",
+    })]
+    result = rig.agent.generate("DPIIT documents?", "", [], "DPIIT documents")
+    assert result["status"] == "answered"
+    assert result["sources"]
+    assert rig.models.chat.calls == 2
+
+
+def test_empty_initial_retrieval_reformulates_before_answering(rig, monkeypatch):
+    search = rig.r.search
+    queries = []
+
+    def first_empty(query):
+        queries.append(query)
+        return [] if len(queries) == 1 else search(query)
+
+    monkeypatch.setattr(rig.r, "search", first_empty)
+    result = rig.agent.generate("Help with recognition", "", [], "Help with recognition")
+    assert result["status"] == "answered"
+    assert len(queries) == 2 and queries[0] != queries[1]
+    assert result["sources"]
+
+
+def test_repair_does_not_bypass_failed_verification(rig):
+    rig.models.grounding = False
+    result = rig.agent.generate("DPIIT documents?", "", [], "DPIIT documents")
+    assert result["status"] == "insufficient_evidence"
+    assert result["_diagnostic"]["failure_reason"] == "unsupported_claims"
+    assert rig.models.chat.calls == 2
+
+
 def test_failed_grounding_and_verifier_outage_fail_closed(rig):
     e = Evidence(6000)
     e.add(rig.r.search("DPIIT"))
@@ -366,6 +414,44 @@ def test_generation_failure_has_no_partial_turn_or_stuck_lease(rig):
     assert rig.store.history_page(cid) == []
     with rig.store.lease(cid):
         pass
+
+
+@pytest.mark.parametrize("message", ["ok", " OK! ", "okay", "got it", "thanks", "thank you!", "theek hai", "ठीक है"])
+def test_acknowledgments_after_answer_skip_models_and_remain_idempotent(rig, message):
+    cid = rig.store.conversation("alice")["id"]
+    rig.agent.respond("alice", cid, "DPIIT?", str(uuid.uuid4()))
+    calls = (rig.models.chat.calls, len(rig.models.utilities), rig.models.provider.calls)
+    rid = str(uuid.uuid4())
+    result = rig.agent.respond("alice", cid, message, rid)
+    assert result["status"] == "conversational"
+    assert result["sources"] == []
+    assert result["answer"] != "I could not confirm this from the available information. Please ask a StartupFlora expert to verify the details."
+    assert rig.agent.respond("alice", cid, message, rid) == result
+    assert calls == (rig.models.chat.calls, len(rig.models.utilities), rig.models.provider.calls)
+
+
+@pytest.mark.parametrize("message", ["okay you help 7000 plus business am i right", "ok how can I get funding", "thanks, what documents are required?", "sure am I eligible?", "not ok"])
+def test_factual_followups_are_not_classified_as_acknowledgments(message):
+    assert conversational_reply(message) is None
+
+
+def test_ambiguous_sic_certificate_asks_for_clarification_without_models(rig):
+    cid = rig.store.conversation("alice")["id"]
+    count = rig.models.provider.calls
+    result = rig.agent.respond("alice", cid, "how can i get my sic certificate", str(uuid.uuid4()))
+    assert result["status"] == "clarification"
+    assert "DPIIT" in result["answer"] and "NSIC" in result["answer"]
+    assert result["sources"] == []
+    assert rig.models.chat.calls == 0 and rig.models.provider.calls == count
+    # The user's choice must return to ordinary retrieval, not another clarification.
+    result = rig.agent.respond("alice", cid, "Startup India DPIIT certificate", str(uuid.uuid4()))
+    assert result["status"] == "answered"
+    assert result["sources"]
+
+
+@pytest.mark.parametrize("message", ["NSIC certificate", "DPIIT certificate", "Startup India (SIC) certificate", "basic certificate", "how can I get funding"])
+def test_known_certificate_names_and_other_questions_use_retrieval(message):
+    assert certificate_clarification(message) is None
 
 
 def test_simple_greeting_avoids_models_and_embeddings(rig):

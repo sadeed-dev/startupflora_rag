@@ -2,6 +2,7 @@
 
 import json
 import logging
+from urllib.parse import urlsplit
 
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -10,8 +11,18 @@ from qdrant_client import models as qm
 from .prompts import RERANK_PROMPT
 from .schemas import Ranking
 from .text import digest, rrf, token_count
+from .timing import stage, timed
 
 log = logging.getLogger(__name__)
+
+
+def qdrant_connection_url(url):
+    """Avoid Windows localhost IPv6 connection delays without changing corpus identity."""
+    parts = urlsplit(url)
+    if parts.hostname == "localhost" and parts.username is None:
+        authority = "127.0.0.1" + (f":{parts.port}" if parts.port is not None else "")
+        return parts._replace(netloc=authority).geturl()
+    return url
 
 
 class Retriever:
@@ -24,7 +35,7 @@ class Retriever:
             QdrantClient(path=settings.qdrant_path)
             if settings.qdrant_mode == "local"
             else QdrantClient(
-                url=settings.qdrant_url, api_key=settings.qdrant_key or None, timeout=15
+                url=qdrant_connection_url(settings.qdrant_url), api_key=settings.qdrant_key or None, timeout=15
             )
         )
         target = settings.qdrant_path if settings.qdrant_mode == "local" else settings.qdrant_url
@@ -37,9 +48,10 @@ class Retriever:
             raise
         self.vector_store = None
 
-    def ensure_collection(self):
+    def ensure_collection(self, *, signature_checked=False):
         """Create/validate the vector collection and lazily attach its LangChain adapter."""
-        self.store.assert_embedding_signature(self.models.signature)
+        if not signature_checked:
+            self.store.assert_embedding_signature(self.models.signature)
         if self.vector_store is not None:
             return
         if not self.q.collection_exists(self.s.collection):
@@ -70,12 +82,14 @@ class Retriever:
                 validate_collection_config=False,
             )
 
+    @timed("retrieval")
     def search(self, query: str, rerank=True):
         """Fuse semantic and literal-term candidates, validate active IDs, and cache only rankings."""
-        self.store.assert_embedding_signature(self.models.signature)
-        if not self.store.document_count():
-            return []
-        self.ensure_collection()
+        with stage("retrieval_setup"):
+            self.store.assert_embedding_signature(self.models.signature)
+            if not self.store.document_count():
+                return []
+            self.ensure_collection(signature_checked=True)
         revision = self.store.revision()
         fingerprint = {
             "query": query,
@@ -83,8 +97,9 @@ class Retriever:
             "embedding": self.models.signature,
             "candidates": self.s.candidates,
             "final": self.s.final_chunks,
-            "rerank": bool(rerank and self.s.rerank),
-            "rank_model": self.s.utility_model,
+            "rerank": bool(rerank and self.s.rerank and not self.s.fast_mode and not self.s.minimum_calls),
+            "rank_provider": self.s.chat_provider,
+            "rank_model": self.s.effective_utility_model,
             "version": 2,
         }
         cache_key = digest(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False))
@@ -92,16 +107,19 @@ class Retriever:
             cached = self.store.search_cached(cache_key, self.s.search_cache_seconds)
             if cached is not None:
                 return self.store.get_chunks(cached)
-        vector = self.models.embeddings.embed_query(query)
-        documents = self.vector_store.similarity_search_by_vector(vector, k=self.s.candidates * 2)
+        with stage("embedding"):
+            vector = self.models.embeddings.embed_query(query)
+        with stage("vector_search"):
+            documents = self.vector_store.similarity_search_by_vector(vector, k=self.s.candidates * 2)
         ids = [str(d.metadata.get("chunk_id", d.metadata.get("_id", ""))) for d in documents]
         dense = [c["id"] for c in self.store.get_chunks(ids)][: self.s.candidates]
-        keyword = self.store.keyword_search(query, self.s.candidates)
+        with stage("keyword_search"):
+            keyword = self.store.keyword_search(query, self.s.candidates)
         fused = rrf([dense, keyword])[: self.s.candidates]
         found = self.store.get_chunks(fused)
         chosen = found[: self.s.final_chunks]
         cacheable = True
-        if found and rerank and self.s.rerank:
+        if found and rerank and self.s.rerank and not self.s.fast_mode and not self.s.minimum_calls:
             try:
                 passages, count = [], 0
                 for chunk in found:

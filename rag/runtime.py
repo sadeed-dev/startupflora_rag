@@ -15,11 +15,18 @@ def runtime():
     settings = load_settings()
     settings.validate()
     store = create_store(settings)
-    models = Models(settings, store)
+    try:
+        models = Models(settings, store)
+    except BaseException:
+        if hasattr(store, "close"):
+            store.close()
+        raise
     try:
         retriever = Retriever(settings, store, models)
     except BaseException:
         models.close()
+        if hasattr(store, "close"):
+            store.close()
         raise
     return settings, store, models, retriever, Agent(settings, store, models, retriever)
 
@@ -27,7 +34,13 @@ def runtime():
 def close_runtime():
     """Release local Qdrant locks on CLI exit or API shutdown."""
     if runtime.cache_info().currsize:
-        _, _, models, retriever, _ = runtime()
-        retriever.close()
-        models.close()
-        runtime.cache_clear()
+        _, store, models, retriever, _ = runtime()
+        try:
+            retriever.close()
+        finally:
+            try:
+                models.close()
+            finally:
+                if hasattr(store, "close"):
+                    store.close()
+                runtime.cache_clear()

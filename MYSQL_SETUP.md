@@ -113,6 +113,25 @@ mat karo. New empty dedicated database choose karna safe hai.
 
 ## 5. Activate MySQL only after migration is complete
 
+If MySQL already contains records, stop writers and back up SQLite first, then use:
+
+```powershell
+python migrate_sqlite_to_mysql.py --from-db data/v2/rag-server.sqlite3 --merge-existing
+```
+
+This mode inserts missing rows and verifies overlapping durable records. It
+refuses conflicting documents, embeddings, conversations, messages, or saved
+request answers and rolls back the data transaction. Existing HTTP and verified
+answer cache entries are retained when they differ. It also copies missing
+verified-answer cache entries and advances the corpus revision to invalidate old
+search results. It preserves unrelated MySQL conversations and checks that both
+databases use the same Qdrant namespace. Keep writers stopped until the switch
+is complete; rerunning it does not duplicate records.
+
+MySQL is now the default backend. The Python service reads
+`startupflora_rag/.env`; the frontend's `.env` does not configure Python storage.
+MySQL connection errors do not fall back to SQLite.
+
 Existing .env mein sirf yeh line change karo:
 
 ```env
@@ -145,6 +164,32 @@ SELECT COUNT(*) AS cached_embeddings FROM embedding_cache;
 SELECT role,content FROM messages ORDER BY created_at DESC LIMIT 10;
 SELECT id,source,title,position,text FROM chunks LIMIT 5;
 ```
+
+### Readable dates in Workbench
+
+Run `readable_datetime_views.sql` in Workbench, then refresh the **Views** list.
+Open `documents_report`, `chunks_report`, `messages_report`, or the other
+`*_report` views to see date columns as `YYYY-MM-DD HH:MM:SS` in India Standard
+Time (UTC+05:30). For example, `1791983609.9972234` becomes
+`2026-10-14 18:43:29`. The views format existing and future rows automatically.
+
+The script covers indexing, conversations, messages, embedding/search/answer
+caches, HTTP checks, leases, requests, and rate locks. The answer-cache view is
+created only if its lazily initialized table exists; rerun the script after the
+first cached answer if needed. The existing `chat_messages_report` and
+`chat_conversations_report` views remain available.
+
+For request timing/usage logs, open `rag_request_timings_report` after running
+the updated script. Its `created_at` is India time for existing and future rows:
+`2026-10-21 05:37:24` UTC displays as `2026-10-21 11:07:24` IST. The source
+`rag_request_timings.created_at` remains a UTC DATETIME, so the conversion is
+applied exactly once without changing historical records. No backend restart
+is needed to use the report view.
+
+The original tables keep numeric timestamps because the application uses them
+for expiration, rate limits, and pagination. Selecting the original tables will
+still show these numbers; use the report views for readable dates. Change the
+script's `USE` statement if your database has a different name.
 
 If previous counts abhi bhi 492/2844 hain, migration ke baad same counts expected
 hain; source meanwhile changed ho toh us source ke actual counts match karo.

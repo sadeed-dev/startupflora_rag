@@ -1,7 +1,7 @@
 """MySQL/MariaDB store: same RAG interface, InnoDB transactions and FULLTEXT search.
 
 Purpose: SQLite ke records ko MySQL mein store karo; Qdrant vectors stay unchanged.
-Every operation opens its own connection, so background threads never share cursors.
+Transactions borrow exclusive connections from a bounded, thread-safe pool.
 """
 
 import json
@@ -13,12 +13,16 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from queue import Empty, LifoQueue
 
 import pymysql
 from pymysql.cursors import DictCursor
 
+from .answer_cache import AnswerCache
+from .request_tracking import RequestTrackingStore
 from .store import BusyConversation, RateLimited
 from .text import keyword_expression
+from .timing import stage
 
 
 class _Row(dict):
@@ -72,18 +76,18 @@ class _Session:
 
     def execute(self, sql, params=None):
         """Execute a MySQL statement with bound parameters; never interpolate user text."""
-        with self.connection.cursor() as cursor:
+        with stage("database_query"), self.connection.cursor() as cursor:
             cursor.execute(sql, params)
             return _Result(cursor)
 
     def executemany(self, sql, rows):
         """Insert/update a batch using the driver's parameter binding."""
-        with self.connection.cursor() as cursor:
+        with stage("database_query"), self.connection.cursor() as cursor:
             cursor.executemany(sql, rows)
             return _Result(cursor)
 
 
-class MySQLStore:
+class MySQLStore(AnswerCache, RequestTrackingStore):
     """Store active chunks, ownership, history and caches in a dedicated InnoDB database."""
 
     def document(self, source):
@@ -428,10 +432,22 @@ class MySQLStore:
         self.path = (
             f"mysql:{settings.mysql_database}"  # Safe label; never include password.
         )
+        self._pool = LifoQueue(maxsize=settings.mysql_pool_size)
+        self._pool_slots = threading.BoundedSemaphore(settings.mysql_pool_size)
+        self._pool_guard = threading.Lock()
+        self._pool_closed = False
         # DDL commits implicitly in MySQL. Run before any migration/data transaction.
+        try:
+            self._initialize_schema()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize_schema(self):
         with self.connect() as db:
             for statement in SCHEMA:
                 db.execute(statement)
+            self.request_timing_table(db)
             db.execute(
                 "INSERT IGNORE INTO corpus_meta (`key`,value) VALUES ('revision','0')"
             )
@@ -444,9 +460,8 @@ class MySQLStore:
             if version != "1":
                 raise ValueError("Unsupported MySQL RAG schema version")
 
-    @contextmanager
-    def connect(self):
-        """Purpose: thread-private connection; success commit, failure rollback, finally close."""
+    def _new_connection(self):
+        """Configure each new physical connection once, before it enters the pool."""
         tls = {}
         if self.s.mysql_ssl_ca:
             tls = dict(
@@ -481,13 +496,69 @@ class MySQLStore:
                     "SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,ONLY_FULL_GROUP_BY'"
                 )
                 cursor.execute("SET SESSION innodb_lock_wait_timeout=15")
-            yield _Session(connection)
-            connection.commit()
+            return connection
         except BaseException:
-            connection.rollback()
+            connection.close()
+            raise
+
+    def _checkout(self):
+        if not self._pool_slots.acquire(timeout=self.s.mysql_pool_timeout):
+            raise ValueError("MySQL connection pool is busy; retry shortly")
+        try:
+            with self._pool_guard:
+                if self._pool_closed:
+                    raise ValueError("MySQL connection pool is closed")
+            try:
+                connection = self._pool.get_nowait()
+            except Empty:
+                return self._new_connection()
+            try:
+                # Do not transparently reconnect inside an active transaction.
+                connection.ping(reconnect=False)
+                return connection
+            except pymysql.Error:
+                connection.close()
+                return self._new_connection()
+        except BaseException:
+            self._pool_slots.release()
+            raise
+
+    @contextmanager
+    def connect(self):
+        """Borrow one connection per transaction; never share it between threads."""
+        with stage("database_acquire"):
+            connection = self._checkout()
+        reusable = True
+        try:
+            yield _Session(connection)
+            with stage("database_commit"):
+                connection.commit()
+        except BaseException:
+            try:
+                with stage("database_rollback"):
+                    connection.rollback()
+            except BaseException:
+                reusable = False
             raise
         finally:
-            connection.close()
+            try:
+                with self._pool_guard:
+                    if reusable and not self._pool_closed and connection.open:
+                        self._pool.put_nowait(connection)
+                    else:
+                        connection.close()
+            finally:
+                self._pool_slots.release()
+
+    def close(self):
+        """Close idle sockets; outstanding borrowers close their sockets on return."""
+        with self._pool_guard:
+            self._pool_closed = True
+            while True:
+                try:
+                    self._pool.get_nowait().close()
+                except Empty:
+                    break
 
     def replace_document(self, source, title, hash_, signature, entries):
         """Purpose: new active chunks/page fingerprint ek transaction mein publish karo."""

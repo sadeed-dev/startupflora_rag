@@ -2,28 +2,31 @@
 # This file connects to AI models, caches text vectors, and checks input limits.
 
 import json
+
 # Converts Python dictionaries/lists into JSON text.
-
 from typing import TypeVar
+
 # Lets us describe a flexible type for a function's return value.
-
 from langchain_core.embeddings import Embeddings
+
 # Base class defining the methods an embedding implementation should provide.
-
 from langchain_core.messages import SystemMessage
+
 # Creates a message containing instructions for the AI.
-
 from langchain_core.prompts import ChatPromptTemplate
-# Builds AI messages using fixed instructions and placeholders.
 
+# Builds AI messages using fixed instructions and placeholders.
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
 # ChatOpenAI: creates a client for generating AI answers.
 # OpenAIEmbeddings: creates a client for converting text into vectors.
-
 from pydantic import BaseModel
-# Used to define the fields and types expected in structured answers.
 
+# Used to define the fields and types expected in structured answers.
 from .text import digest, token_count
+from .timing import stage
+from .usage import EmbeddingUsageClient, TokenUsageCallback
+
 # Imports two helpers from your project's text.py file.
 # digest(): creates an identifier from text.
 # token_count(): counts tokens in text.
@@ -215,17 +218,17 @@ class Models:
             api_key=settings.openai_key,
             # API key used to authenticate requests.
 
-            timeout=25,
-            # Configure a 25-second request timeout.
+            timeout=settings.model_timeout_seconds,
+            # Allow slower generations without changing the embedding timeout.
 
-            max_retries=1,
-            # Allow one retry for a retryable request failure.
+            max_retries=0 if settings.fast_mode or settings.minimum_calls else 1,
+            # Fast requests must not spend a second timeout on retries.
 
             temperature=0,
             # Request less random output.
             # This does not guarantee identical answers every time.
 
-            max_tokens=1800,
+            max_tokens=settings.max_output_tokens if settings.minimum_calls else settings.answer_max_tokens,
             # Default maximum number of output tokens.
 
             store=False,
@@ -236,12 +239,22 @@ class Models:
             # Configure this client to use the Chat Completions API.
         )
 
-        self.chat = chat or ChatOpenAI(model=settings.chat_model, **args)
+        chat_class = ChatOpenAI
+        if settings.chat_provider == "gemini":
+            from .gemini import GEMINI_BASE_URL, GeminiChat
+
+            chat_class = GeminiChat
+            args.pop("store", None)
+            args.update(api_key=settings.gemini_key, base_url=GEMINI_BASE_URL,
+                        reasoning_effort=settings.gemini_reasoning_effort)
+        self.chat = chat or chat_class(model=settings.effective_chat_model,
+            callbacks=[TokenUsageCallback(settings.chat_provider, settings.effective_chat_model)], **args)
         # Use chat if a truthy model object was supplied.
         # Otherwise create a ChatOpenAI client with the configured chat model.
         # **args passes all dictionary entries as named arguments.
 
-        self.utility = utility or ChatOpenAI(model=settings.utility_model, **args)
+        self.utility = utility or chat_class(model=settings.effective_utility_model,
+            callbacks=[TokenUsageCallback(settings.chat_provider, settings.effective_utility_model)], **args)
         # Use the supplied utility model or create one.
         # structured() below uses this model for structured answers.
 
@@ -249,6 +262,7 @@ class Models:
             # Use supplied embeddings or create an OpenAI embedding client.
 
             api_key=settings.openai_key,
+            base_url="https://api.openai.com/v1",
             # API key for embedding requests.
 
             model=settings.embedding_model,
@@ -257,10 +271,10 @@ class Models:
             dimensions=settings.dimensions,
             # Requested number of values in each vector.
 
-            request_timeout=25,
-            # Configure a 25-second request timeout.
+            request_timeout=5 if settings.fast_mode else 25,
+            # Leave time for generation after query embedding.
 
-            max_retries=1,
+            max_retries=0 if settings.fast_mode or settings.minimum_calls else 1,
             # Allow one retry for a retryable failure.
 
             # Chunks are already bounded. This avoids another tokenizer/download
@@ -270,58 +284,27 @@ class Models:
             # embed_documents() above checks each text's length itself.
         )
 
+        if embeddings is None:
+            provider.client = EmbeddingUsageClient(provider.client, settings.embedding_model)
         self.embeddings = CachedEmbeddings(store, provider, self.signature)
         # Wrap the embedding provider with our cache logic.
         # Calling self.embeddings can now reuse saved vectors.
 
     def guard(self, messages, tools=None):
-        # Check the size of messages and tool/schema definitions.
-        # tools=None means tools are optional.
-
-        """Cap serialized model inputs before provider calls, including advertised tool schemas."""
-
+        """Estimate the whole serialized input, including schema and protocol overhead."""
+        from langchain_core.messages import convert_to_openai_messages
         from langchain_core.utils.function_calling import convert_to_openai_tool
-        # Import the helper that converts tools/schemas into OpenAI tool definitions.
-        # This import happens when guard() is called.
 
-        payload = [ 
-            # Build a list of dictionaries from the messages.
-
-            {
-                "role": m.type,
-                # Store the LangChain message type, such as "system" or "human".
-
-                "content": m.content,
-                # Store the message's text or other content.
-
-                "tool_calls": getattr(m, "tool_calls", []),
-                # Read m.tool_calls if the attribute exists.
-                # Otherwise use [].
-            }
-
-            for m in messages
-            # Repeat for every message.
-        ]
-
-        schemas = [convert_to_openai_tool(t, strict=True) for t in tools or []]
-        # Convert each supplied tool/schema into an OpenAI tool definition.
-        # strict=True requests strict schema handling.
-        # tools or [] uses an empty list when no tools were supplied.
-
-        if (
-            token_count(json.dumps([payload, schemas], ensure_ascii=False))
-            # Convert messages and schemas into JSON text, then count tokens.
-            # ensure_ascii=False preserves non-ASCII characters directly.
-
-            > self.s.model_input_tokens
-            # Check whether this count exceeds the configured input budget.
-        ):
+        payload = {
+            "messages": convert_to_openai_messages(messages),
+            "tools": [convert_to_openai_tool(t, strict=True) for t in tools or []],
+            "tool_choice": "Answer", "parallel_tool_calls": False,
+            "model": self.s.effective_chat_model,
+        }
+        estimated = token_count(json.dumps(payload, ensure_ascii=False)) + 64
+        if estimated > self.s.model_input_tokens:
             raise ModelFailure("Input budget exceeded; reduce retrieval or history budgets")
-            # Stop before the request.
-            # Reduce retrieved text or conversation history to make it smaller.
-        # If the check passes, this method finishes without returning a value.
-        # This is a budget check using this serialization,
-        # rather than an exact measurement of the provider's final request.
+        return estimated
 
     def structured(self, schema: type[T], instructions: str, payload: dict, max_tokens=1000) -> T:
         # Ask the utility model for an answer matching a Pydantic schema.
@@ -369,7 +352,8 @@ class Models:
             # Include the original response along with the parsed result/errors.
         )
 
-        output = runner.invoke(messages)
+        with stage(f"model_{schema.__name__.lower()}"):
+            output = runner.invoke(messages)
         # Send the messages to the model.
         # The result includes raw, parsed, and parsing_error entries.
 

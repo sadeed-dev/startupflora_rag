@@ -1,8 +1,10 @@
-"""Copy the existing v2 SQLite corpus/history/cache to EMPTY MySQL tables.
+"""Copy the existing v2 SQLite corpus/history/cache to MySQL tables.
 
 Purpose: embeddings dobara banaye bina MySQL use karo. Stop chat/API/ingestion
 first. Original SQLite file and Qdrant vectors are never modified. This script
 never calls OpenAI or writes .env. Migration is one atomic data transaction.
+Use --merge-existing to add missing records to an existing database. Durable
+conflicts abort; differing disposable HTTP/answer cache entries stay in MySQL.
 """
 
 import argparse
@@ -44,6 +46,92 @@ ORDER = {
     "answers": "conversation_id,request_id",
     "corpus_meta": "key",
 }
+
+
+def merge_existing(source_path, settings):
+    """Add missing rows to an existing MySQL corpus; abort on conflicting durable data.
+
+    Stop writers first. Existing rows are compared, not overwritten. Search caches
+    and active locks are not portable. Bump the revision to invalidate old ranks.
+    """
+    source_path = Path(source_path).resolve()
+    if not source_path.is_file():
+        raise ValueError("Existing SQLite file not found")
+    mysql = MySQLStore(settings)
+    copied = {}
+    with closing(sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)) as source:
+        source.execute("BEGIN")
+        source_meta = dict(source.execute("SELECT key,value FROM corpus_meta"))
+        target = settings.qdrant_path if settings.qdrant_mode == "local" else settings.qdrant_url
+        expected = f"langchain-v2|{target}|{settings.collection}|{settings.embedding_model}:{settings.dimensions}"
+        if source_meta.get("namespace") != expected:
+            raise ValueError("Source namespace differs from the configured Qdrant collection/model")
+        tables = dict(TABLES)
+        if source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='verified_answer_cache'").fetchone():
+            # MySQL DDL commits implicitly; create the optional cache before the data transaction.
+            with mysql.connect() as db:
+                mysql.answer_cache_table(db)
+            tables["verified_answer_cache"] = ("cache_key", "response", "created_at")
+        with mysql.connect() as db:
+            db.execute("SELECT value FROM schema_meta WHERE `key`='version' FOR UPDATE")
+            target_meta = {r["key"]: r["value"] for r in db.execute("SELECT `key`,value FROM corpus_meta FOR UPDATE")}
+            if target_meta.get("namespace") not in (None, expected):
+                raise ValueError("MySQL namespace differs; cannot merge different vector stores")
+            for table, columns in tables.items():
+                if table == "corpus_meta":
+                    continue
+                keys = ORDER.get(table, "cache_key").split(",")
+                key_positions = [columns.index(key) for key in keys]
+                selection = ",".join(
+                    "SHA2(`vector`,256) AS `vector`" if column == "vector" else f"`{column}`"
+                    for column in columns
+                )
+                query = f"SELECT {quoted_columns(columns)} FROM `{table}` ORDER BY {quoted_columns(keys)}"
+                rows = source.execute(query)
+                inserted = matched = retained = 0
+                while batch := rows.fetchmany(64):
+                    predicate = f"({quoted_columns(keys)}) IN ({','.join('(' + ','.join('%s' for _ in keys) + ')' for _ in batch)})"
+                    params = tuple(row[pos] for row in batch for pos in key_positions)
+                    def read_batch():
+                        return {
+                            tuple(r[key] for key in keys): tuple(r[column] for column in columns)
+                            for r in db.execute(f"SELECT {selection} FROM `{table}` WHERE {predicate} FOR UPDATE", params)
+                        }
+                    def comparable(row):
+                        return tuple(hashlib.sha256(value.encode()).hexdigest() if columns[i] == "vector" else value for i, value in enumerate(row))
+                    existing = read_batch()
+                    missing = []
+                    kept = {}
+                    for row in batch:
+                        key = tuple(row[pos] for pos in key_positions)
+                        if key not in existing:
+                            missing.append(row)
+                        elif existing[key] != comparable(row):
+                            if table in {"http_cache", "verified_answer_cache"}:
+                                kept[key] = existing[key]
+                                retained += 1
+                            else:
+                                raise ValueError(f"Conflicting {table} record; merge rolled back without overwriting data")
+                        else:
+                            matched += 1
+                    if missing:
+                        db.executemany(
+                            f"INSERT INTO `{table}` ({quoted_columns(columns)}) VALUES ({','.join('%s' for _ in columns)})",
+                            missing,
+                        )
+                        actual = read_batch()
+                        if any(actual.get(tuple(row[pos] for pos in key_positions)) != kept.get(tuple(row[pos] for pos in key_positions), comparable(row)) for row in batch):
+                            raise ValueError(f"Verification failed for {table}; merge rolled back")
+                    inserted += len(missing)
+                copied[table] = inserted
+                print(f"Verified {table}: {inserted} added, {matched} identical, {retained} existing cache entries preserved", flush=True)
+            for key, value in source_meta.items():
+                if key == "revision":
+                    value = str(max(int(value), int(target_meta.get(key, "0"))) + 1)
+                elif key in target_meta and target_meta[key] != value:
+                    raise ValueError("Conflicting corpus metadata; merge rolled back")
+                db.execute("INSERT INTO corpus_meta (`key`,value) VALUES (%s,%s) ON DUPLICATE KEY UPDATE value=VALUES(value)", (key, value))
+    return copied
 
 
 def row_hash(rows):
@@ -159,10 +247,12 @@ def main():
     parser.add_argument(
         "--from-db", help="Existing SQLite file; defaults to DB_PATH from .env"
     )
+    parser.add_argument("--merge-existing", action="store_true", help="Add missing rows to existing MySQL data; refuse conflicting records")
     args = parser.parse_args()
     settings = load_settings()
     try:
-        result = migrate(args.from_db or settings.db_path, settings)
+        operation = merge_existing if args.merge_existing else migrate
+        result = operation(args.from_db or settings.db_path, settings)
     except (ValueError, sqlite3.Error) as exc:
         raise SystemExit(str(exc)) from None
     print(

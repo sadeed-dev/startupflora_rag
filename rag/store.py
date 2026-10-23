@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .text import keyword_expression
+from .answer_cache import AnswerCache
+from .request_tracking import RequestTrackingStore
 
 
 def create_store(settings):
@@ -34,7 +36,7 @@ class RequestConflict(Exception):
     """A request UUID was reused for a different message."""
 
 
-class Store:
+class Store(AnswerCache, RequestTrackingStore):
     def __init__(self, path: str):
         """Create durable tables and indexes; never load conversation data into global memory."""
         self.path = path
@@ -76,6 +78,7 @@ class Store:
               conversation_id TEXT NOT NULL, request_id TEXT NOT NULL, answer TEXT NOT NULL,
               PRIMARY KEY(conversation_id,request_id));
             """)
+            self.request_timing_table(db)
 
     @contextmanager
     def connect(self):

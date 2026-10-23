@@ -303,8 +303,10 @@ no live-quality benchmark has been claimed for this project.
 `data/v2` contains private chat history and cache data. Protect and back it up
 with the Qdrant volume/directory; set a retention policy for your users. The app's
 DELETE endpoint removes its own stored conversation data, not independent backups
-or provider-held data. Model calls use `store=False`, but messages/evidence still
-travel to OpenAI and remain subject to your provider/account policies. LangSmith
+or provider-held data. OpenAI chat calls use `store=False`. Messages/evidence go
+to the configured chat provider (OpenAI or Google Gemini), and embedding inputs
+go to OpenAI. Gemini requests follow Google's provider/account policies; the
+OpenAI `store` parameter is not sent to Gemini. LangSmith
 tracing is not enabled by the application; enabling it yourself sends trace data
 to that service. Application error logs omit chat text, keys and provider bodies.
 
@@ -319,3 +321,186 @@ Official documentation used:
 - [LangChain tools](https://docs.langchain.com/oss/python/langchain/tools)
 - [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling)
 - [Sitemap protocol](https://www.sitemaps.org/protocol.html)
+
+## Response performance
+
+The Python backend reads these settings from `startupflora_rag/.env` (restart
+the server after environment changes):
+
+```env
+DB_BACKEND=mysql
+MYSQL_POOL_SIZE=5
+MYSQL_POOL_TIMEOUT=10
+FINAL_CHUNKS=3
+ANSWER_MAX_TOKENS=1000
+VERIFY_ANSWERS=true
+ENABLE_RERANK=true
+```
+
+Each API process maintains a bounded pool of exclusive MySQL connections.
+Session settings are applied once per physical connection. Transactions commit
+or roll back before the connection returns to the pool; stale sockets are
+replaced before a transaction starts. Queries are never automatically retried
+inside a transaction. Shutdown closes idle and returned connections. The pool
+limit applies per process, so account for the worker count when sizing MySQL.
+
+Ordinary answers target 60 to 100 words, with a 1000-token model output limit.
+Three final passages are selected per search. Verification and reranking remain
+enabled; complex questions can still require additional model calls.
+
+Every `/chat` request emits a `rag_request_timing` JSON record through the
+Uvicorn logger, including its request ID, total duration, stage durations, and
+call counts. Stages include `retrieval`, `generation`, `verification`,
+`persistence`, `database_acquire`, `database_query`, `database_commit`, and
+`database_rollback` when applicable. Utility model calls are labelled
+`model_ranking`, `model_query`, `model_memory`, or `model_grounding`.
+Retrieval also records `retrieval_setup`, `embedding`, `vector_search`, and
+`keyword_search` for work actually executed on a cache miss.
+Parent stages include their child timings, so do not add all stages together.
+Cache hits and greetings omit model stages they do not execute. Timings include
+failed requests and exclude prompts, answers, credentials, and submitted contact
+details. With the local hidden server launch, records are in
+`data/rag-mysql.stderr.log`; foreground launches print them to the terminal.
+
+## Gemini answers with existing OpenAI embeddings
+
+The hybrid setup uses Google's documented
+[OpenAI-compatible endpoint](https://ai.google.dev/gemini-api/docs/openai)
+through the already-installed LangChain client. No Google SDK is required.
+Configure the Python backend's `.env`:
+
+```env
+CHAT_PROVIDER=gemini
+GEMINI_API_KEY=your-google-key
+GEMINI_CHAT_MODEL=gemini-3.8-flash
+GEMINI_UTILITY_MODEL=gemini-3.8-flash
+MODEL_TIMEOUT_SECONDS=90
+GEMINI_REASONING_EFFORT=low
+OPENAI_API_KEY=your-existing-openai-key
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
+VERIFY_ANSWERS=true
+```
+
+Gemini handles answers, reranking, query rewriting, summaries, and grounding
+verification. OpenAI handles document/query embeddings using the original cache,
+model, dimensions, and Qdrant collection. Switching the chat provider requires no
+re-embedding or SQL migration. Keep the existing Qdrant target/collection and
+embedding settings. MySQL conversation and lead storage are unchanged.
+
+The Gemini adapter preserves Google's opaque tool-call signatures across
+follow-up calls and uses JSON schemas plus application-side validation. Search
+and answer caches include the active provider/model so results are not confused
+between providers. Both provider keys are required; authentication failures do
+not silently fall back to another provider. Keys stay in the backend environment
+and are excluded from diagnostic output and answer-cache fingerprints.
+
+Restart the RAG process after changing `.env`. `python main.py doctor` reports
+the effective chat/utility provider and models without displaying keys.
+`server.env` has the same provider settings but an empty Gemini-key placeholder;
+set that key separately in the server environment when deploying. `CHAT_MODEL`
+and `UTILITY_MODEL` are used only when `CHAT_PROVIDER=openai`.
+
+For a 20-second website response target, use
+`gemini-3.1-flash-lite`, `FAST_MODE=true`,
+`MODEL_TIMEOUT_SECONDS=10`, `RESPONSE_TIMEOUT_SECONDS=18`, and
+`ANSWER_MAX_TOKENS=600`. Fast mode disables provider retries, model reranking,
+query rewriting, memory summarization, additional retrieval tools and answer
+repair. Follow-up retrieval includes recent user messages; generation still sees
+conversation history. Existing citation checks remain mandatory.
+`VERIFY_ANSWERS` is respected separately: enabling it adds a verification call.
+Answer caching works with verification enabled or disabled. Cache keys include
+the verification setting, so an unchecked answer cannot satisfy a verified request.
+
+The current local configuration and backend deployment template allow 25 seconds
+per model call and a 35-second API processing budget. The website uses
+`RAG_TIMEOUT_MS=40000` (40 seconds), configurable in `startupflora-next/.env`
+up to 55 seconds within the routes' 60-second runtime budget. For the shorter
+profile above, also set `RAG_TIMEOUT_MS=19000`.
+The API returns HTTP 504 after its processing budget. A slow provider can therefore
+produce a timeout message rather than an answer. These are wait limits, not a
+guarantee of successful answers within 20 seconds. Workers finish their current
+blocking operation after HTTP timeout, then reject late answers before saving.
+Restart both backend and website after these changes.
+
+Local Qdrant connections use IPv4 (`127.0.0.1`) when the configured host is
+`localhost`, avoiding repeated Windows IPv6 connection delays. The stored
+namespace still uses the configured URL, so this needs no data migration.
+
+`ANSWER_CACHE_SECONDS=-1` (the default and local setting) keeps accepted answers
+without time-based expiry. Use `86400` for one-day reuse or `0` to disable caching.
+Only successful answers with accepted citations are cached. Self-contained
+questions, including "give me count of total success stories", can reuse the same user's saved answer after unrelated turns,
+in another conversation, or after a server restart. Case and extra whitespace
+do not affect matching. Questions that depend on earlier context, such as
+"What are its fees?" or "DPIIT for my company?", retain conversation handling.
+Cache hits make no retrieval, embedding, generation, rewrite, or verification
+provider calls; chat turns are still saved. Inspect `answer_cache: "hit"` and
+empty `token_usage` in request timings to confirm reuse. CLI `--debug` deliberately
+bypasses answer/search caches and should not be used to test cache hits.
+Corpus changes, model/settings changes and code changes trigger a fresh answer.
+The existing `verified_answer_cache` table name is retained for compatibility;
+no database migration is needed. Entries are no longer deleted automatically
+after seven days, so storage grows with distinct cached questions and revisions.
+Bypassed questions now include `answer_cache_reason` in the timing log: `disabled`
+or `context_dependent`. Cache eligibility no longer requires a named service.
+
+Each provider call logs `rag_token_usage` with provider, model, operation,
+request ID and reported input/output/total tokens. These entries also appear in
+`rag_request_timing.token_usage`, alongside `answer_cache` (`hit`, `miss`,
+`bypass` or `request_replay`). A cache hit uses no generation or embedding API
+calls. Embedding counts come from the OpenAI response before LangChain discards
+its usage metadata. Missing counts and failed calls use `usage_reported=false`
+and null counts; they do not assert zero cost. Logs contain no prompts, answers
+or keys, and counts are not a currency/credit estimate. Provider retries can
+include usage that the final response does not report.
+
+### Timing and token tracking table
+
+Authenticated, validated `POST /chat` attempts are stored in one table,
+`rag_request_timings`, in the configured MySQL database (or SQLite database).
+The table and indexes are created automatically at startup; restart the backend
+after updating the code. No extra database or AI calls are needed to view it.
+
+Each HTTP attempt has a unique `attempt_id`; retries can share a `request_id`
+and still have separate rows. Columns include `conversation_id`, UTC
+`created_at`, `status_code`, `outcome`, `answer_cache`, `total_ms`,
+`provider_calls`, `input_tokens`, `output_tokens`, `total_tokens`,
+`unreported_usage_calls`, and `usage_complete`. `stages_ms`, `calls` and
+`token_usage` store the detailed JSON breakdown from the terminal log.
+Questions, answers, user identities and credentials are not copied into this table.
+
+Writes run after the HTTP response and do not count toward `total_ms`.
+If a request times out while its worker is still running, `usage_complete=0`;
+when the worker finishes, the same row is updated with late usage and
+`usage_complete=1`, while the HTTP status remains 504. Token totals sum known
+counts only: inspect `unreported_usage_calls` before treating totals as complete.
+Tracking-write failures are logged without changing the chat response.
+Requests rejected before the chat handler (authentication/input validation) are
+not included. Historical terminal logs are not imported automatically.
+
+Recent requests:
+
+```sql
+SELECT created_at, request_id, status_code, outcome, answer_cache,
+       ROUND(total_ms / 1000, 2) AS seconds, provider_calls,
+       input_tokens, output_tokens, total_tokens,
+       unreported_usage_calls, usage_complete
+FROM rag_request_timings
+ORDER BY created_at DESC, attempt_id DESC
+LIMIT 100;
+```
+
+Daily usage (UTC):
+
+```sql
+SELECT DATE(created_at) AS day, COUNT(*) AS attempts,
+       SUM(CASE WHEN answer_cache = 'hit' THEN 1 ELSE 0 END) AS cache_hits,
+       SUM(provider_calls) AS provider_calls,
+       SUM(total_tokens) AS reported_tokens,
+       SUM(unreported_usage_calls) AS calls_without_usage,
+       ROUND(AVG(total_ms) / 1000, 2) AS avg_seconds
+FROM rag_request_timings
+GROUP BY DATE(created_at)
+ORDER BY day DESC;
+```

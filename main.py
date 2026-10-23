@@ -29,6 +29,7 @@ def doctor():
             "openai_key": "configured"
             if s.openai_key and s.openai_key != "replace-me"
             else "missing/placeholder",
+            "gemini_key": "configured" if s.gemini_key and s.gemini_key != "replace-me" else "missing/placeholder",
             "backend_key": "configured"
             if len(s.backend_key) >= 32 and not s.backend_key.startswith("replace-")
             else "not set (needed only for API)",
@@ -50,7 +51,10 @@ def doctor():
             ),
             "sqlite_source": s.db_path,
             "models": {
-                "chat": s.chat_model,
+                "chat_provider": s.chat_provider,
+                "chat": s.effective_chat_model,
+                "utility": s.effective_utility_model,
+                "embedding_provider": "openai",
                 "embedding": s.embedding_model,
                 "dimensions": s.dimensions,
             },
@@ -131,6 +135,7 @@ def build_parser():
         )
         if name == "ask":
             command.add_argument("question")
+            command.add_argument("--debug", action="store_true", help="Show request diagnostics and bypass answer/search caches")
         command.add_argument("--user", default="local-demo")
         command.add_argument("--conversation")
     remove = subs.add_parser("remove-source", help="Remove one obsolete indexed source")
@@ -214,10 +219,16 @@ def main():
         elif args.command == "chat":
             interactive(agent, store, args.user, args.conversation)
         else:
+            from rag.timing import request_timings
+
+            if args.debug:
+                s.answer_cache_seconds = 0
+                s.search_cache_seconds = 0
             cid = store.conversation(args.user, args.conversation)["id"]
-            output(
-                agent.respond(args.user, cid, args.question.strip(), str(uuid.uuid4()))
-            )
+            request_id = str(uuid.uuid4())
+            with request_timings(request_id) as trace:
+                result = agent.respond(args.user, cid, args.question.strip(), request_id)
+            output({"response": result, "debug": trace} if args.debug else result)
     except (ValueError, FileNotFoundError) as exc:
         # Settings hide sensitive input values in their validation errors.
         raise SystemExit(str(exc)) from None

@@ -134,6 +134,8 @@ def fit_messages(messages: list[dict], budget: int) -> list[dict]:
     pairs = [messages[i : i + 2] for i in range(0, len(messages), 2)]
     kept, total = [], 0
     for pair in reversed(pairs):
+        if len(pair) != 2 or [m["role"] for m in pair] != ["user", "assistant"]:
+            continue
         count = sum(token_count(m["content"]) + 8 for m in pair)
         if total + count > budget:
             break

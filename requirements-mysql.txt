@@ -1,0 +1,2 @@
+# Optional driver-only installation for existing environments; also in requirements.txt.
+PyMySQL==1.2.3

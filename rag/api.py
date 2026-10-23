@@ -1,18 +1,30 @@
 """Private service: call from an authenticated website backend, not browsers."""
 
+import hashlib
 import logging
 import secrets
 from contextlib import asynccontextmanager
+from functools import partial
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
+import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, field_validator
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse
 
+from .request_tracking import RequestTimingWriter
 from .runtime import close_runtime, runtime
 from .store import BusyConversation, RateLimited, RequestConflict
+from .timing import request_deadline, request_timings
 
 log = logging.getLogger(__name__)
+BACKEND_REVISION = hashlib.sha256(
+    b"".join((Path(__file__).parent / name).read_bytes() for name in ("agent.py", "minimum.py", "retrieval.py", "prompts.py"))
+).hexdigest()[:12]
 
 
 @asynccontextmanager
@@ -74,7 +86,7 @@ User = Annotated[str, Depends(trusted_user)]
 @app.get("/health")
 def health():
     """Provide liveness without exposing configuration or claiming upstream readiness."""
-    return {"status": "ok"}  # Liveness only; does not claim upstream availability.
+    return {"status": "ok", "revision": BACKEND_REVISION}  # Liveness, not upstream readiness.
 
 
 @app.post("/conversations")
@@ -89,14 +101,41 @@ def create_conversation(user: User):
 
 
 @app.post("/chat")
-def chat(body: ChatRequest, user: User):
-    """Enforce ownership and rate limits, then map known failures to stable HTTP statuses."""
-    s, store, _, _, agent = runtime()
+async def chat(body: ChatRequest, user: User):
+    """Stop waiting before the website deadline even if an upstream stalls."""
+    settings, store, *_ = runtime()
+    headers = None
+    with request_timings(body.request_id) as trace, request_deadline(settings.response_timeout_seconds):
+        writer = RequestTimingWriter(store, trace, body.conversation_id)
+        try:
+            with anyio.fail_after(settings.response_timeout_seconds):
+                result = await anyio.to_thread.run_sync(partial(_tracked_chat, body, user, writer), abandon_on_cancel=True)
+            trace.update(status_code=200, outcome=result.get("status", "success"))
+        except TimeoutError:
+            trace.update(status_code=504, outcome="timeout")
+            result = {"detail": "The assistant took too long. Please retry your message."}
+        except HTTPException as exc:
+            trace.update(status_code=exc.status_code, outcome="error")
+            result, headers = {"detail": exc.detail}, exc.headers
+    writer.http_finished()
+    return JSONResponse(jsonable_encoder(result), status_code=trace["status_code"],
+                        headers=headers, background=BackgroundTask(writer.save))
+
+
+def _tracked_chat(body, user, writer):
+    """Observe worker completion even when the HTTP response has timed out."""
     try:
-        # Check ownership before spending rate allowance or calling AI.
-        store.conversation(user, str(body.conversation_id))
-        store.check_rate(user, s.rpm)
-        return agent.respond(user, str(body.conversation_id), body.message, str(body.request_id))
+        return _chat(body, user)
+    finally:
+        writer.worker_finished()
+
+
+def _chat(body: ChatRequest, user: str):
+    """Enforce ownership and rate limits, then map known failures to stable HTTP statuses."""
+    _, _, _, _, agent = runtime()
+    try:
+        # The agent checks ownership once before applying the API rate limit.
+        return agent.respond(user, str(body.conversation_id), body.message, str(body.request_id), enforce_rate_limit=True)
     except LookupError:
         raise HTTPException(404, "Conversation not found")
     except BusyConversation:
