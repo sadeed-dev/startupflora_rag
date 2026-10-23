@@ -14,7 +14,7 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS rag_unanswered_questions (
     search_query TEXT NOT NULL,
     retrieved_pages JSON NOT NULL,
     failure_reason VARCHAR(64) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME(6) NOT NULL DEFAULT (DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 330 MINUTE)),
     PRIMARY KEY (conversation_id, request_id),
     INDEX idx_unanswered_created (created_at)
 ) CHARACTER SET utf8mb4"""

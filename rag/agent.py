@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from .diagnostics import record_unanswered
+from .citations import normalize_citations
 from .llm import ModelFailure
 from .minimum import REFERENCE, TOPICS, generate_minimum, resolve_followup
 from .prompts import REWRITE_PROMPT, SUMMARY_PROMPT, SYSTEM_PROMPT
@@ -146,8 +147,8 @@ class Agent:
     @timed("verification")
     def validate_answer(self, data: Answer, evidence: Evidence):
         """Reject invented IDs/links and optionally verify every factual claim against its citations."""
-        answer = data.answer.strip()
-        ids = list(dict.fromkeys(data.source_ids))
+        answer = normalize_citations(data.answer).strip()
+        ids = list(dict.fromkeys(sid.upper() if re.fullmatch(r"[sS]\d+", sid) else sid for sid in data.source_ids))
         inline = set(re.findall(r"\[(S\d+)\]", answer))
         validation_errors = []
         if any(id_ not in evidence.items for id_ in ids) or inline - evidence.items.keys():
@@ -361,41 +362,57 @@ class Agent:
                 # and hit. Context-dependent questions retain the existing memory path.
                 rows = self.store.recent(cid, 100)
                 normalized_question = re.sub(r"\s+", " ", message.strip()).casefold()
-                reusable = (
-                    self.s.answer_cache_seconds != 0
-                    and (
-                        standalone_cache_question(message)
-                        or (
-                            not conversation["summary"] and not conversation["summarized_seq"]
-                            and len(rows) < 100
-                            and all(re.sub(r"\s+", " ", row["content"].strip()).casefold() == normalized_question
-                                    for row in rows if row["role"] == "user")
-                        )
-                    )
-                )
+                standalone = standalone_cache_question(message)
+                reusable = self.s.answer_cache_seconds != 0
+                # Follow-ups are cacheable within a specific user context. Ignore
+                # exact repeats and social replies so repeating a question does
+                # not itself invalidate the answer. The last relevant user turn
+                # identifies the complete immutable context prefix, even beyond
+                # the model's recent-history window or a rewritten summary.
+                context = None if standalone or not reusable else {
+                    "conversation_id": cid,
+                    "anchor_seq": self.store.answer_context_anchor(cid, lambda text:
+                        conversational_reply(text) is None
+                        and re.sub(r"\s+", " ", text.strip()).casefold() != normalized_question
+                    ),
+                }
                 revision = self.store.revision()
                 key = None
                 cached = None
                 if not reusable:
-                    record_answer_cache("bypass", reason=(
-                        "disabled" if self.s.answer_cache_seconds == 0 else "context_dependent"
-                    ))
+                    record_answer_cache("bypass", reason="disabled")
                 if reusable:
-                    record_answer_cache("miss")
                     fingerprint = {
                         "user": user_id, "question": normalized_question, "revision": revision,
+                        "context": context,
                         "settings": self.s.model_dump(exclude={"openai_key", "gemini_key", "backend_key", "mysql_password", "qdrant_key"}),
                         "code": hashlib.sha256(b"".join(
                             (Path(__file__).parent / name).read_bytes()
-                            for name in ("agent.py", "minimum.py", "prompts.py", "schemas.py", "retrieval.py", "llm.py", "gemini.py", "usage.py")
+                            for name in ("agent.py", "answer_cache.py", "minimum.py", "citations.py", "prompts.py", "schemas.py", "retrieval.py", "llm.py", "gemini.py", "usage.py")
                         )).hexdigest(),
                     }
                     key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
+                    record_answer_cache("miss", reason="not_found_expired_or_invalidated", details={
+                        "key": key, "scope": "standalone" if standalone else "conversation_context",
+                        "corpus_revision": revision,
+                        "code_revision": fingerprint["code"][:12],
+                        "settings_signature": hashlib.sha256(json.dumps(fingerprint["settings"], sort_keys=True).encode()).hexdigest()[:12],
+                    })
                     try:
                         cached = self.store.cached_answer(key, self.s.answer_cache_seconds)
+                        if cached is not None and (
+                            cached.get("status") != "answered" or not cached.get("sources")
+                            or not isinstance(cached.get("answer"), str) or not cached["answer"].strip()
+                        ):
+                            cached = None
+                            record_answer_cache("miss", reason="invalid_cached_answer")
                     except Exception:
                         log.warning("answer_cache_read_failed")
-                summary, history = ("", []) if reusable else self.memory(conversation, rows)
+                        record_answer_cache("miss", reason="cache_read_failed")
+                usable_cache = cached is not None and self.store.revision() == revision
+                # A hit must precede memory compaction and query rewriting, both
+                # of which may otherwise make model calls for contextual questions.
+                summary, history = ("", []) if standalone or usable_cache else self.memory(conversation, rows)
                 query = message
                 if (history or summary) and not self.s.fast_mode and not self.s.minimum_calls:
                     try:
@@ -415,8 +432,8 @@ class Agent:
                             query = rewritten.query.strip()
                     except Exception:
                         log.warning("Query rewrite unavailable; searching the original question")
-                if cached is not None and self.store.revision() == revision:
-                    record_answer_cache("hit")
+                if usable_cache:
+                    record_answer_cache("hit", reason="accepted_answer_reused")
                     result = cached
                 else:
                     unresolved = False
@@ -434,8 +451,10 @@ class Agent:
                     if key and result["status"] == "answered" and result["sources"] and self.store.revision() == revision:
                         try:
                             self.store.cache_answer(key, {k: result[k] for k in ("answer", "sources", "status")})
+                            record_answer_cache("miss", details={"saved": True})
                         except Exception:
                             log.warning("answer_cache_write_failed")
+                            record_answer_cache("miss", reason="cache_write_failed", details={"saved": False})
             ensure_request_active()
             result.update(
                 conversation_id=cid,

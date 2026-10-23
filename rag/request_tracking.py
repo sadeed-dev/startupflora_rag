@@ -19,11 +19,12 @@ class RequestTrackingStore:
         mysql = hasattr(self, "s")
         payload_type = "LONGTEXT" if mysql else "TEXT"
         indexes = ", INDEX timing_request_id (request_id), INDEX timing_created_at (created_at)" if mysql else ""
+        date_type = "DATETIME(6)" if mysql else "DATETIME"
         db.execute(f"""CREATE TABLE IF NOT EXISTS rag_request_timings (
             attempt_id VARCHAR(36) PRIMARY KEY,
             request_id VARCHAR(64) NOT NULL,
             conversation_id VARCHAR(36) NOT NULL,
-            created_at DATETIME NOT NULL,
+            created_at {date_type} NOT NULL,
             status_code INTEGER NOT NULL,
             outcome VARCHAR(32) NOT NULL,
             answer_cache VARCHAR(24) NOT NULL,
@@ -82,7 +83,7 @@ class RequestTimingWriter:
         self.http_done = False
         self.identity = {
             "attempt_id": str(uuid.uuid4()), "conversation_id": str(conversation_id),
-            # Keep storage in UTC; rag_request_timings_report displays all rows in IST.
+            # Snapshot UTC; the MySQL date adapter persists IST, SQLite keeps UTC.
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         }
 

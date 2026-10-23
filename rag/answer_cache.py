@@ -10,6 +10,29 @@ import time
 class AnswerCache:
     """Use bound values and keep cached responses separate from request history."""
 
+    def answer_context_anchor(self, cid, meaningful):
+        """Find the last non-repeat user turn in bounded, indexed history pages.
+
+        Its sequence identifies the immutable user-history prefix, even when the
+        recent model context rolls over or a derived summary is rewritten.
+        """
+        marker = "%s" if hasattr(self, "s") else "?"
+        before = None
+        with self.connect() as db:
+            while True:
+                boundary = f" AND seq<{marker}" if before is not None else ""
+                params = (cid, before) if before is not None else (cid,)
+                rows = db.execute(
+                    f"SELECT seq,content FROM messages WHERE conversation_id={marker} "
+                    f"AND role='user'{boundary} ORDER BY seq DESC LIMIT 100", params,
+                ).fetchall()
+                for row in rows:
+                    if meaningful(row["content"]):
+                        return row["seq"]
+                if len(rows) < 100:
+                    return 0
+                before = rows[-1]["seq"]
+
     def answer_cache_table(self, db):
         mysql = hasattr(self, "s")
         db.execute("""CREATE TABLE IF NOT EXISTS verified_answer_cache (
@@ -19,7 +42,7 @@ class AnswerCache:
         )""" if not mysql else """CREATE TABLE IF NOT EXISTS verified_answer_cache (
             cache_key VARCHAR(64) PRIMARY KEY,
             response LONGTEXT NOT NULL,
-            created_at DOUBLE NOT NULL
+            created_at DATETIME(6) NOT NULL
         ) CHARACTER SET utf8mb4""")
 
     def cached_answer(self, key, ttl):

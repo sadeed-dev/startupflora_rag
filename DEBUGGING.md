@@ -65,6 +65,30 @@ metadata is derived from those citations and logged as
 `citation_metadata_reconciled: true`. Unknown IDs and uncited answers still fail;
 the server never adds citations to uncited claims.
 
+## Why a stored answer may not be reused
+
+Chat history (`messages`/`answers`) and the reusable `verified_answer_cache` are
+different. A saved failed response in chat history is not a reusable answer.
+Successful cache entries are specific to a user, normalized question, corpus,
+generation configuration, and answer code. Contextual requests also use the
+conversation and last non-repeat user turn to identify their context. Asking
+about a different service or supplying new personal details changes that key.
+Code or configuration edits intentionally invalidate old cached answers.
+
+Check `answer_cache`, `answer_cache_reason`, and `answer_cache_details` in the
+request's timing log. Compare key, scope, corpus revision, code revision, and
+settings signature across requests. A hit returns before retrieval, rewriting,
+memory compaction, or generation. The key hash contains no readable question or
+identity. Read/write failures are recorded separately and do not fail the chat.
+The CLI `--debug` flag still deliberately disables caching.
+
+For fresh generation, grouped markers such as `[S1, S2]`, semicolon groups,
+lowercase IDs and bracket typography are normalized before validation. This
+does not add evidence to uncited claims, accept unknown IDs, or remove factual
+checks. Empty/irrelevant retrieval, unsupported answers, refusals, and truncated
+output can still produce a fallback. Inspect `answer_diagnostic.reason` rather
+than assuming every fallback means missing content.
+
 `retrieved_pages` lists retrieval candidates, while the runtime diagnostic identifies
 which chunks survived the context/input budgets. Audit records contain user questions;
 normal diagnostic logs contain IDs and decisions only. If the diagnostic reports

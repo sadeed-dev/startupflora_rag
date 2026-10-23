@@ -434,6 +434,9 @@ questions, including "give me count of total success stories", can reuse the sam
 in another conversation, or after a server restart. Case and extra whitespace
 do not affect matching. Questions that depend on earlier context, such as
 "What are its fees?" or "DPIIT for my company?", retain conversation handling.
+They now also cache successful answers within their conversation context; changing
+the topic or supplying new user details creates a different cache key. Repeating
+the same question does not invalidate that key, even after history rolls over.
 Cache hits make no retrieval, embedding, generation, rewrite, or verification
 provider calls; chat turns are still saved. Inspect `answer_cache: "hit"` and
 empty `token_usage` in request timings to confirm reuse. CLI `--debug` deliberately
@@ -442,8 +445,11 @@ Corpus changes, model/settings changes and code changes trigger a fresh answer.
 The existing `verified_answer_cache` table name is retained for compatibility;
 no database migration is needed. Entries are no longer deleted automatically
 after seven days, so storage grows with distinct cached questions and revisions.
-Bypassed questions now include `answer_cache_reason` in the timing log: `disabled`
-or `context_dependent`. Cache eligibility no longer requires a named service.
+`answer_cache_reason` records disabled caching, read/write failures, invalid saved
+entries, missing/expired/invalidated entries, or accepted answer reuse. Timing logs
+also include `answer_cache_details`: the hashed key, scope, corpus revision, code
+revision and settings signature. Cached answers are checked before memory or
+query-rewrite calls. Failed answers never populate the reusable cache.
 
 Each provider call logs `rag_token_usage` with provider, model, operation,
 request ID and reported input/output/total tokens. These entries also appear in
@@ -463,7 +469,7 @@ The table and indexes are created automatically at startup; restart the backend
 after updating the code. No extra database or AI calls are needed to view it.
 
 Each HTTP attempt has a unique `attempt_id`; retries can share a `request_id`
-and still have separate rows. Columns include `conversation_id`, UTC
+and still have separate rows. Columns include `conversation_id`, IST
 `created_at`, `status_code`, `outcome`, `answer_cache`, `total_ms`,
 `provider_calls`, `input_tokens`, `output_tokens`, `total_tokens`,
 `unreported_usage_calls`, and `usage_complete`. `stages_ms`, `calls` and
@@ -491,7 +497,7 @@ ORDER BY created_at DESC, attempt_id DESC
 LIMIT 100;
 ```
 
-Daily usage (UTC):
+Daily usage (IST in migrated MySQL; UTC in SQLite):
 
 ```sql
 SELECT DATE(created_at) AS day, COUNT(*) AS attempts,

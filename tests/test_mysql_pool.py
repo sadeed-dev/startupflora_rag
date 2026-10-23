@@ -79,7 +79,7 @@ def test_reuses_connections_and_initializes_session_once(pool):
             db.execute("SELECT 1")
     assert len(connections) == 1
     assert connections[0].commits == 4
-    assert sum(sql.startswith("SET SESSION") for sql in connections[0].statements) == 3
+    assert sum(sql.startswith("SET SESSION") for sql in connections[0].statements) == 4
 
 
 def test_rolls_back_before_reusing_connection(pool):

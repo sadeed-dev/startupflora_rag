@@ -16,6 +16,7 @@ from pathlib import Path
 
 from rag.config import load_settings
 from rag.mysql_store import MySQLStore
+from rag.mysql_dates import DATE_COLUMNS, IST, to_storage
 
 # Exact application columns only: do not copy SQLite FTS shadow tables or MySQL
 # auto-generated row_id/source_hash columns. FULLTEXT is maintained by InnoDB.
@@ -46,6 +47,16 @@ ORDER = {
     "answers": "conversation_id,request_id",
     "corpus_meta": "key",
 }
+
+
+def normalized_row(table, columns, row):
+    """Compare timestamps at MySQL DATETIME(6) precision during copy verification."""
+    fields = DATE_COLUMNS.get(table, {})
+    return tuple(
+        to_storage(value, "epoch").replace(tzinfo=IST).timestamp()
+        if fields.get(column) == "epoch" else value
+        for column, value in zip(columns, row)
+    )
 
 
 def merge_existing(source_path, settings):
@@ -98,7 +109,8 @@ def merge_existing(source_path, settings):
                             for r in db.execute(f"SELECT {selection} FROM `{table}` WHERE {predicate} FOR UPDATE", params)
                         }
                     def comparable(row):
-                        return tuple(hashlib.sha256(value.encode()).hexdigest() if columns[i] == "vector" else value for i, value in enumerate(row))
+                        normalized = normalized_row(table, columns, row)
+                        return tuple(hashlib.sha256(value.encode()).hexdigest() if columns[i] == "vector" else value for i, value in enumerate(normalized))
                     existing = read_batch()
                     missing = []
                     kept = {}
@@ -226,7 +238,7 @@ def migrate(source_path, settings):
                     db.executemany(insert, batch)
                     copied[table] += len(batch)
                 # Verify content, not just counts. Read exact copied columns in key order.
-                expected_hash = row_hash(source.execute(query))
+                expected_hash = row_hash(normalized_row(table, columns, row) for row in source.execute(query))
                 actual_hash = row_hash(
                     tuple(row[column] for column in columns)
                     for row in db.execute(query)

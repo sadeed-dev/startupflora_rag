@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from .llm import ModelFailure
+from .citations import normalize_citations
 from .retrieval import Evidence
 from .schemas import Answer
 from .timing import ensure_request_active, record_answer_diagnostic, stage
@@ -88,6 +89,12 @@ def resolve_followup(message, history):
 
 def reconcile_citation_metadata(data, evidence):
     """Derive link metadata from existing valid inline citations; never insert citations."""
+    normalized = data.model_copy(update={
+        "answer": normalize_citations(data.answer),
+        "source_ids": [sid.upper() if re.fullmatch(r"[sS]\d+", sid) else sid for sid in data.source_ids],
+    })
+    changed = normalized != data
+    data = normalized
     inline = list(dict.fromkeys(re.findall(r"\[(S\d+)\]", data.answer)))
     if (
         inline
@@ -96,7 +103,7 @@ def reconcile_citation_metadata(data, evidence):
         and set(inline) != set(data.source_ids)
     ):
         return data.model_copy(update={"source_ids": inline}), True
-    return data, False
+    return data, changed
 
 
 def generate_minimum(agent, message, history, query):

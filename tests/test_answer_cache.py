@@ -128,7 +128,7 @@ def test_success_story_count_repeats_hit_cache_after_other_questions(rig, minimu
     "What are its fees?", "Tell me more", "How much?", "What about eligibility?",
     "How do I apply?", "Give me their success stories", "I have a GST registration",
 ])
-def test_contextual_requests_keep_cache_bypass_reason(rig, question):
+def test_contextual_requests_use_context_scoped_cache(rig, question):
     from rag.agent import standalone_cache_question
     from rag.timing import request_timings
 
@@ -137,8 +137,85 @@ def test_contextual_requests_keep_cache_bypass_reason(rig, question):
     ask(rig, cid)
     with request_timings("context") as trace:
         ask(rig, cid, question)
-    assert trace["answer_cache"] == "bypass"
-    assert trace["answer_cache_reason"] == "context_dependent"
+    assert trace["answer_cache"] == "miss"
+    assert trace["answer_cache_details"]["scope"] == "conversation_context"
+
+
+@pytest.mark.parametrize("minimum_calls", [True, False])
+@pytest.mark.parametrize("question", ["How do I register my startup?", "What are its fees?", "DPIIT for my company?"])
+def test_contextual_repeats_skip_all_model_calls_including_memory(rig, monkeypatch, minimum_calls, question):
+    from rag.timing import request_timings
+
+    rig.s.minimum_calls = minimum_calls
+    cid = rig.store.conversation("alice")["id"]
+    ask(rig, cid, "DPIIT documents?")
+    first = ask(rig, cid, question)
+    assert first["status"] == "answered"
+    before = (rig.models.chat.calls, len(rig.models.utilities), rig.models.provider.calls)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A context cache hit must not call memory or retrieval")
+    monkeypatch.setattr(rig.agent, "memory", forbidden)
+    monkeypatch.setattr(rig.r, "search", forbidden)
+    for _ in range(2):
+        with request_timings("context-repeat") as trace:
+            result = ask(rig, cid, question)
+        assert trace["answer_cache"] == "hit"
+        assert result["answer"] == first["answer"]
+        assert before == (rig.models.chat.calls, len(rig.models.utilities), rig.models.provider.calls)
+
+
+def test_followup_cache_is_not_reused_after_topic_changes(rig):
+    from rag.timing import request_timings
+
+    cid = rig.store.conversation("alice")["id"]
+    ask(rig, cid, "DPIIT documents?")
+    ask(rig, cid, "What are its fees?")
+    before = rig.models.chat.calls
+    ask(rig, cid, "GST registration documents?")
+    with request_timings("changed-topic") as trace:
+        ask(rig, cid, "What are its fees?")
+    assert trace["answer_cache"] == "miss"
+    assert rig.models.chat.calls > before
+
+
+def test_context_cache_survives_history_rollover_and_summary_changes(rig, monkeypatch):
+    from rag.timing import request_timings
+
+    cid = rig.store.conversation("alice")["id"]
+    ask(rig, cid, "DPIIT documents?")
+    question = "How do I register my startup?"
+    first = ask(rig, cid, question)
+    for _ in range(105):
+        rig.store.save_turn(cid, str(uuid.uuid4()), question, {
+            "answer": first["answer"], "sources": first["sources"], "status": "answered",
+        })
+    rig.store.update_summary(cid, "A rewritten derived summary", 150)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A cache hit must not generate or rewrite a summary")
+    monkeypatch.setattr(rig.agent, "memory", forbidden)
+    with request_timings("old-context") as trace:
+        result = ask(rig, cid, question)
+    assert result["answer"] == first["answer"]
+    assert trace["answer_cache"] == "hit"
+
+
+def test_cache_errors_are_visible_and_failed_entries_are_not_returned(rig, monkeypatch):
+    from rag.timing import request_timings
+
+    cid = rig.store.conversation("alice")["id"]
+    monkeypatch.setattr(rig.store, "cached_answer", lambda *args: {
+        "answer": "Old fallback", "sources": [], "status": "insufficient_evidence",
+    })
+    with request_timings("invalid-cache") as trace:
+        result = ask(rig, cid)
+    assert result["answer"] != "Old fallback"
+    assert trace["answer_cache_reason"] == "invalid_cached_answer"
+    def failed(*args):
+        raise RuntimeError("private database error")
+    monkeypatch.setattr(rig.store, "cached_answer", failed)
+    with request_timings("cache-outage") as trace:
+        ask(rig, cid)
+    assert trace["answer_cache_reason"] == "cache_read_failed"
 
 
 def test_verification_disabled_reuses_answer_without_models_or_embeddings(rig):

@@ -167,29 +167,20 @@ SELECT id,source,title,position,text FROM chunks LIMIT 5;
 
 ### Readable dates in Workbench
 
-Run `readable_datetime_views.sql` in Workbench, then refresh the **Views** list.
-Open `documents_report`, `chunks_report`, `messages_report`, or the other
-`*_report` views to see date columns as `YYYY-MM-DD HH:MM:SS` in India Standard
-Time (UTC+05:30). For example, `1791983609.9972234` becomes
-`2026-10-14 18:43:29`. The views format existing and future rows automatically.
+Follow [DATE_MIGRATION.md](DATE_MIGRATION.md) before starting this version against
+an existing database: stop writers, take a backup, inspect `python migrate_dates.py`,
+then run `python migrate_dates.py --apply`. Startup also ensures this migration.
 
-The script covers indexing, conversations, messages, embedding/search/answer
-caches, HTTP checks, leases, requests, and rate locks. The answer-cache view is
-created only if its lazily initialized table exists; rerun the script after the
-first cached answer if needed. The existing `chat_messages_report` and
-`chat_conversations_report` views remain available.
+The original date fields in all 13 timestamp-bearing tables now display
+`YYYY-MM-DD HH:MM:SS` in India Standard Time (UTC+05:30), including existing rows.
+Dates are ordinary DATETIME(6) fields. The migration materializes the dates and
+removes the previous `*_epoch` and `*_utc` helper columns, preserving indexes.
+The adapter handles timestamp conversions for expiry, rate limits, leases and
+pagination; there are no duplicate date columns in the completed schema.
 
-For request timing/usage logs, open `rag_request_timings_report` after running
-the updated script. Its `created_at` is India time for existing and future rows:
-`2026-10-21 05:37:24` UTC displays as `2026-10-21 11:07:24` IST. The source
-`rag_request_timings.created_at` remains a UTC DATETIME, so the conversion is
-applied exactly once without changing historical records. No backend restart
-is needed to use the report view.
-
-The original tables keep numeric timestamps because the application uses them
-for expiration, rate limits, and pagination. Selecting the original tables will
-still show these numbers; use the report views for readable dates. Change the
-script's `USE` statement if your database has a different name.
+Report views are refreshed automatically. The updated `readable_datetime_views.sql`
+can reinstall them after migration; change its `USE` statement if your database
+has a different name. Do not use the old report SQL that adds another IST offset.
 
 If previous counts abhi bhi 492/2844 hain, migration ke baad same counts expected
 hain; source meanwhile changed ho toh us source ke actual counts match karo.

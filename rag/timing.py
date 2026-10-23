@@ -27,13 +27,15 @@ def without_request_timings():
         _current.reset(token)
 
 
-def record_answer_cache(status, *, reason=None):
+def record_answer_cache(status, *, reason=None, details=None):
     """Report cache decisions without recording questions or user identities."""
     trace = _current.get()
     if trace is not None:
         trace["answer_cache"] = status
         if reason is not None:
             trace["answer_cache_reason"] = reason
+        if details is not None:
+            trace.setdefault("answer_cache_details", {}).update(details)
 
 
 def record_answer_diagnostic(details):

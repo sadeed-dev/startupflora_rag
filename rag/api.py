@@ -23,7 +23,7 @@ from .timing import request_deadline, request_timings
 
 log = logging.getLogger(__name__)
 BACKEND_REVISION = hashlib.sha256(
-    b"".join((Path(__file__).parent / name).read_bytes() for name in ("agent.py", "minimum.py", "retrieval.py", "prompts.py"))
+    b"".join((Path(__file__).parent / name).read_bytes() for name in ("agent.py", "answer_cache.py", "minimum.py", "citations.py", "retrieval.py", "prompts.py"))
 ).hexdigest()[:12]
 
 

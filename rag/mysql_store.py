@@ -23,6 +23,7 @@ from .request_tracking import RequestTrackingStore
 from .store import BusyConversation, RateLimited
 from .text import keyword_expression
 from .timing import stage
+from .mysql_dates import application_parameters, application_row, date_aliases, inspect_columns, migrate_dates, query_dates, refresh_report_views
 
 
 class _Row(dict):
@@ -40,11 +41,11 @@ class _Row(dict):
 class _Result:
     """Buffer one bounded result so later cursor executions cannot invalidate earlier rows."""
 
-    def __init__(self, cursor):
+    def __init__(self, cursor, aliases=None):
         """Copy fetched rows and affected-row count before the cursor is closed."""
         self.rowcount = cursor.rowcount
         self.rows = (
-            [_Row(row) for row in cursor.fetchall()] if cursor.description else []
+            [_Row(application_row(row, aliases or {})) for row in cursor.fetchall()] if cursor.description else []
         )
         self.position = 0
 
@@ -70,21 +71,22 @@ class _Result:
 class _Session:
     """Small parameterized-query interface shared by all methods in this file."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, aliases=None):
         """Keep the transaction's connection private to its current caller/thread."""
         self.connection = connection
+        self.aliases = aliases or {}
 
     def execute(self, sql, params=None):
         """Execute a MySQL statement with bound parameters; never interpolate user text."""
         with stage("database_query"), self.connection.cursor() as cursor:
-            cursor.execute(sql, params)
-            return _Result(cursor)
+            cursor.execute(sql, application_parameters(sql, params, self.aliases))
+            return _Result(cursor, query_dates(sql, self.aliases)[0])
 
     def executemany(self, sql, rows):
         """Insert/update a batch using the driver's parameter binding."""
         with stage("database_query"), self.connection.cursor() as cursor:
-            cursor.executemany(sql, rows)
-            return _Result(cursor)
+            cursor.executemany(sql, [application_parameters(sql, row, self.aliases) for row in rows])
+            return _Result(cursor, query_dates(sql, self.aliases)[0])
 
 
 class MySQLStore(AnswerCache, RequestTrackingStore):
@@ -208,7 +210,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
                 (cid,),
             ).fetchone()[0]
             db.executemany(
-                "INSERT INTO messages VALUES (%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO messages (conversation_id,seq,role,content,created_at,metadata) VALUES (%s,%s,%s,%s,%s,%s)",
                 [
                     (cid, seq + 1, "user", user_text, time.time(), "{}"),
                     (
@@ -351,7 +353,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
                     ).fetchone():
                         continue
                     db.execute(
-                        "INSERT INTO conversations VALUES (%s,%s,%s,%s,%s)",
+                        "INSERT INTO conversations (id,user_id,summary,summarized_seq,created_at) VALUES (%s,%s,%s,%s,%s)",
                         tuple(
                             (
                                 conv[k]
@@ -370,7 +372,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
                     ):
                         meta = row["metadata"] if "metadata" in row.keys() else "{}"
                         db.execute(
-                            "INSERT INTO messages VALUES (%s,%s,%s,%s,%s,%s)",
+                            "INSERT INTO messages (conversation_id,seq,role,content,created_at,metadata) VALUES (%s,%s,%s,%s,%s,%s)",
                             tuple(
                                 (
                                     row[k]
@@ -429,6 +431,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
     def __init__(self, settings):
         """Purpose: dedicated MySQL tables ready karo; existing rows never reset hote hain."""
         self.s = settings
+        self._date_aliases = {}
         self.path = (
             f"mysql:{settings.mysql_database}"  # Safe label; never include password.
         )
@@ -448,6 +451,9 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
             for statement in SCHEMA:
                 db.execute(statement)
             self.request_timing_table(db)
+            self.answer_cache_table(db)
+            from .diagnostics import SCHEMA as diagnostic_schema
+            db.execute(diagnostic_schema)
             db.execute(
                 "INSERT IGNORE INTO corpus_meta (`key`,value) VALUES ('revision','0')"
             )
@@ -457,8 +463,13 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
             version = db.execute(
                 "SELECT value FROM schema_meta WHERE `key`='version'"
             ).fetchone()[0]
-            if version != "1":
+            if version not in {"1", "2"}:
                 raise ValueError("Unsupported MySQL RAG schema version")
+            migrate_dates(db)
+            db.execute("UPDATE schema_meta SET value='2' WHERE `key`='version'")
+            columns = inspect_columns(db)
+            self._date_aliases = date_aliases(columns)
+            refresh_report_views(db, columns)
 
     def _new_connection(self):
         """Configure each new physical connection once, before it enters the pool."""
@@ -530,7 +541,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
             connection = self._checkout()
         reusable = True
         try:
-            yield _Session(connection)
+            yield _Session(connection, self._date_aliases)
             with stage("database_commit"):
                 connection.commit()
         except BaseException:
@@ -671,7 +682,7 @@ class MySQLStore(AnswerCache, RequestTrackingStore):
             )
             try:
                 db.execute(
-                    "INSERT INTO leases VALUES (%s,%s,%s)", (cid, token, now + 180)
+                    "INSERT INTO leases (conversation_id,token,expires) VALUES (%s,%s,%s)", (cid, token, now + 180)
                 )
             except pymysql.IntegrityError as exc:
                 if exc.args[0] != 1062:
@@ -743,41 +754,41 @@ SCHEMA = (
         row_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         source VARCHAR(3000) NOT NULL,
         source_hash BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(source,256))) STORED,
-        title TEXT NOT NULL,hash CHAR(64) NOT NULL,indexed_at DOUBLE NOT NULL,
+        title TEXT NOT NULL,hash CHAR(64) NOT NULL,indexed_at DATETIME(6) NOT NULL,
         embedding_signature VARCHAR(255) NOT NULL,UNIQUE KEY documents_source(source_hash)
     )""",
     """CREATE TABLE IF NOT EXISTS chunks (
         id CHAR(36) PRIMARY KEY,source VARCHAR(3000) NOT NULL,`position` INT NOT NULL,
         title TEXT COLLATE utf8mb4_unicode_ci NOT NULL,
-        `text` LONGTEXT COLLATE utf8mb4_unicode_ci NOT NULL,indexed_at DOUBLE NOT NULL,
+        `text` LONGTEXT COLLATE utf8mb4_unicode_ci NOT NULL,indexed_at DATETIME(6) NOT NULL,
         KEY chunks_source(source(512),`position`),FULLTEXT KEY chunks_fulltext(title,`text`)
     )""",
     """CREATE TABLE IF NOT EXISTS embedding_cache (
-        `key` CHAR(64) PRIMARY KEY,vector LONGTEXT NOT NULL,created_at DOUBLE NOT NULL,
+        `key` CHAR(64) PRIMARY KEY,vector LONGTEXT NOT NULL,created_at DATETIME(6) NOT NULL,
         KEY embedding_age(created_at)
     )""",
     """CREATE TABLE IF NOT EXISTS conversations (
         id CHAR(36) PRIMARY KEY,user_id VARCHAR(255) NOT NULL,summary LONGTEXT NOT NULL,
-        summarized_seq BIGINT NOT NULL DEFAULT 0,created_at DOUBLE NOT NULL,
+        summarized_seq BIGINT NOT NULL DEFAULT 0,created_at DATETIME(6) NOT NULL,
         KEY conversations_user_created(user_id,created_at,id)
     )""",
     """CREATE TABLE IF NOT EXISTS messages (
         conversation_id CHAR(36) NOT NULL,seq BIGINT NOT NULL,role VARCHAR(16) NOT NULL,
-        content LONGTEXT NOT NULL,created_at DOUBLE NOT NULL,metadata LONGTEXT NOT NULL,
+        content LONGTEXT NOT NULL,created_at DATETIME(6) NOT NULL,metadata LONGTEXT NOT NULL,
         PRIMARY KEY(conversation_id,seq)
     )""",
     """CREATE TABLE IF NOT EXISTS leases (
-        conversation_id VARCHAR(255) PRIMARY KEY,token CHAR(36) NOT NULL,expires DOUBLE NOT NULL
+        conversation_id VARCHAR(255) PRIMARY KEY,token CHAR(36) NOT NULL,expires DATETIME(6) NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS requests (
-        user_id VARCHAR(255) NOT NULL,`at` DOUBLE NOT NULL,KEY requests_user_time(user_id,`at`)
+        user_id VARCHAR(255) NOT NULL,`at` DATETIME(6) NOT NULL,KEY requests_user_time(user_id,`at`)
     )""",
     """CREATE TABLE IF NOT EXISTS rate_locks (
-        user_id VARCHAR(255) PRIMARY KEY,touched DOUBLE NOT NULL
+        user_id VARCHAR(255) PRIMARY KEY,touched DATETIME(6) NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS corpus_meta (`key` VARCHAR(64) PRIMARY KEY,value LONGTEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS search_cache (
-        `key` CHAR(64) PRIMARY KEY,chunk_ids LONGTEXT NOT NULL,created_at DOUBLE NOT NULL,
+        `key` CHAR(64) PRIMARY KEY,chunk_ids LONGTEXT NOT NULL,created_at DATETIME(6) NOT NULL,
         KEY search_age(created_at)
     )""",
     """CREATE TABLE IF NOT EXISTS http_cache (
@@ -785,7 +796,7 @@ SCHEMA = (
         source VARCHAR(3000) NOT NULL,
         source_hash BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(source,256))) STORED,
         canonical_source VARCHAR(3000) NOT NULL,etag TEXT,last_modified TEXT,
-        links LONGTEXT NOT NULL,checked_at DOUBLE NOT NULL,
+        links LONGTEXT NOT NULL,checked_at DATETIME(6) NOT NULL,
         UNIQUE KEY http_source(source_hash),KEY http_canonical(canonical_source(512))
     )""",
     """CREATE TABLE IF NOT EXISTS answers (

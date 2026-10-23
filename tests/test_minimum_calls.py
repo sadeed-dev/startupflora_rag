@@ -172,6 +172,31 @@ def test_missing_citation_metadata_is_reconciled_without_another_model_call(mini
     assert minimum.models.chat.calls == 1
 
 
+@pytest.mark.parametrize("citation", ["[S1, S2]", "[S1; S2]", "【S1, S2】", "[s1, s2]"])
+def test_grouped_citations_are_normalized_before_validation(minimum, monkeypatch, citation):
+    chunks = minimum.r.search("DPIIT documents?")
+    monkeypatch.setattr(minimum.r, "search", lambda query: [chunks[0], dict(
+        chunks[0], id="second", text=chunks[0]["text"] + " Second supported passage.",
+    )])
+    minimum.models.chat.next_tools = [("Answer", {
+        "answer": f"The guide lists a registration certificate. {citation}",
+        "source_ids": ["S1", "S2"], "status": "answered",
+    })]
+    result = ask(minimum, minimum.store.conversation("alice")["id"])
+    assert result["status"] == "answered"
+    assert "[S1] [S2]" in result["answer"]
+    assert [source["id"] for source in result["sources"]] == ["S1", "S2"]
+    assert minimum.models.chat.calls == 1
+
+
+def test_grouped_unknown_source_is_still_rejected(minimum):
+    minimum.models.chat.next_tools = [("Answer", {
+        "answer": "Unsupported claim [S1, S99]", "source_ids": ["S1", "S99"], "status": "answered",
+    })]
+    result = ask(minimum, minimum.store.conversation("alice")["id"])
+    assert result["status"] == "insufficient_evidence" and result["sources"] == []
+
+
 @pytest.mark.parametrize("question", ["Which loan schemes are available?", "What is the loan interest rate?", "I need a loan of 10 lakh"])
 def test_specific_loan_questions_still_require_retrieval(minimum, monkeypatch, question):
     searches = []
